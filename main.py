@@ -66,6 +66,7 @@ def setup_database():
                                                             count INTEGER NOT NULL
                  ) WITHOUT ROWID;
                  """)
+
     conn.execute("""
                  CREATE TABLE IF NOT EXISTS processed_files (
                                                                 filename TEXT PRIMARY KEY
@@ -92,6 +93,7 @@ def robust_download(filename, target_dir):
                 filename=filename,
                 repo_type="dataset",
                 cache_dir=target_dir,
+                local_dir_use_symlinks=False,  # Keep files isolated directly inside SSD temp directory
             )
 
         except Exception as e:
@@ -146,23 +148,22 @@ def _flush_counter_to_temp(conn, counter):
     counter.clear()
 
 
-def process_one_file(filepath, conn):
+def process_one_file(filepath, fname, conn):
     """
     Processes a single Parquet file using PyArrow's C++ engine.
-    All counts are accumulated in a TEMP TABLE within a transaction;
-    if anything fails or shutdown is requested, the whole file is rolled back.
-    Returns True on success, False otherwise.
+    All counts AND file tracking are accumulated within a SINGLE transaction.
     """
     try:
         conn.execute("BEGIN TRANSACTION;")
 
-        # We'll SUM later, avoiding the need for UPSERT.
+        # Safely handle temp table lifecycle over the connection lifetime
         conn.execute("""
-                     CREATE TEMP TABLE file_counts (
-                                                       word TEXT,
-                                                       count INTEGER
+                     CREATE TEMP TABLE IF NOT EXISTS file_counts (
+                                                                     word TEXT,
+                                                                     count INTEGER
                      );
                      """)
+        conn.execute("DELETE FROM file_counts;")
 
         pf = ParquetFile(filepath)
         local_counter = Counter()  # accumulates counts for a few batches
@@ -179,12 +180,11 @@ def process_one_file(filepath, conn):
             word_lists = pyarrow.compute.utf8_split_whitespace(text_array)
             flat_words = pyarrow.compute.list_flatten(word_lists)
             batch_counts = pyarrow.compute.value_counts(flat_words)
-            values_arr = batch_counts.field("values")
-            counts_arr = batch_counts.field("counts")
 
-            for i in range(len(batch_counts)):
-                word = values_arr[i].as_py()
-                cnt = counts_arr[i].as_py()
+            # High-speed native C++ extraction structure
+            for record in batch_counts.to_pylist():
+                word = record["values"]
+                cnt = record["counts"]
 
                 if word:
                     local_counter[word] += cnt
@@ -199,6 +199,13 @@ def process_one_file(filepath, conn):
                      SELECT word, SUM(count) FROM file_counts GROUP BY word
                      ON CONFLICT(word) DO UPDATE SET count = word_counts.count + excluded.count;
                      """)
+
+        # Co-locate file logging inside the same transaction to guarantee exact-once atomicity
+        conn.execute(
+            "INSERT OR REPLACE INTO processed_files (filename) VALUES (?);",
+            (fname,),
+        )
+
         conn.commit()
         return True
 
@@ -283,15 +290,10 @@ def main():
             break
 
         info(f"Processing {fname} ...")
-        success = process_one_file(fpath, conn)
+        # Pass fname directly into processing transaction logic
+        success = process_one_file(fpath, fname, conn)
 
         if success:
-            conn.execute(
-                "INSERT OR REPLACE INTO processed_files (filename) VALUES (?);",
-                (fname,),
-            )
-
-            conn.commit()
             files_done_this_run += 1
             elapsed = time() - start_time
             avg_time = elapsed / files_done_this_run
@@ -331,4 +333,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
